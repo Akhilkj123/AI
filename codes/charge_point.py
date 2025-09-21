@@ -1,5 +1,4 @@
-┌──(ocpp-venv)─(kali㉿kali)-[~/Final_Project/Project]
-└─$ cat charge_point.py  
+
 #!/usr/bin/env python3
 # charge_point.py
 import asyncio
