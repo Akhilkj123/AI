@@ -1,28 +1,33 @@
+#!/usr/bin/env python3
+# proxy.py
+# Secure OCPP 1.6 Proxy with attack detection & mitigation
+
 import asyncio
-import json
-import time
-import hashlib
-import hmac
-import logging
 import websockets
+import json
+import logging
+import time
+import hmac
+import hashlib
+from collections import defaultdict, deque
 
 # ================= CONFIG =================
 
-CENTRAL_URI = "ws://localhost:9000"
 PROXY_HOST = "0.0.0.0"
 PROXY_PORT = 9090
 
-SHARED_SECRET = b"proxy-shared-secret"
+CENTRAL_URI = "ws://localhost:9000"
+SECRET_KEY = b"SuperSecretKey123"
 
-FLOOD_WINDOW = 1.0        # seconds
-FLOOD_LIMIT = 20          # messages per window
+HEARTBEAT_TIMEOUT = 30        # seconds (suppression detection)
+FLOOD_LIMIT = 5              # messages
+FLOOD_WINDOW = 2             # seconds
 
-EXPECTED_FLOW = [
+EXPECTED_ORDER = [
     "BootNotification",
-    "Authorize",
-    "StartTransaction",
     "Heartbeat",
-    "StopTransaction"
+    "StartTransaction",
+    "StopTransaction",
 ]
 
 # ================= LOGGING =================
@@ -30,141 +35,146 @@ EXPECTED_FLOW = [
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("proxy")
 
-# ================= SECURITY CONTEXT =================
+# ================= STATE =================
 
-class ClientContext:
-    def __init__(self):
-        self.seen_nonces = set()
-        self.last_action_index = -1
-        self.msg_times = []
+seen_nonces = set()
+last_action = {}
+last_message_time = {}
+message_times = defaultdict(deque)
+active_connections = {}   # <---- REQUIRED FOR SUPPRESSION MITIGATION
 
-    def check_replay(self, nonce):
-        if nonce in self.seen_nonces:
-            return True
-        self.seen_nonces.add(nonce)
-        return False
+# ================= SECURITY UTILS =================
 
-    def check_reordering(self, action):
-        if action not in EXPECTED_FLOW:
-            return False
+def verify_signature(payload, nonce, ts, signature):
+    msg = f"{payload}{nonce}{ts}".encode()
+    expected = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
 
-        idx = EXPECTED_FLOW.index(action)
-        if idx < self.last_action_index:
-            return True
+# ================= HEARTBEAT WATCHDOG =================
 
-        self.last_action_index = idx
-        return False
+async def heartbeat_watchdog():
+    while True:
+        now = time.time()
+        for cp_id, last_seen in list(last_message_time.items()):
+            if now - last_seen > HEARTBEAT_TIMEOUT:
+                logger.error(
+                    "[SECURITY] Heartbeat SUPPRESSION detected for %s (%.1fs silent) – closing connection",
+                    cp_id,
+                    now - last_seen,
+                )
 
+                ws = active_connections.get(cp_id)
+                if ws:
+                    await ws.close(code=4001, reason="Heartbeat suppression detected")
 
-# ================= SIGNATURE =================
+                last_message_time.pop(cp_id, None)
+                active_connections.pop(cp_id, None)
 
-def verify_signature(envelope):
-    try:
-        payload = envelope["payload"]
-        received_sig = envelope["signature"]
+        await asyncio.sleep(5)
 
-        computed = hmac.new(
-            SHARED_SECRET,
-            payload.encode(),
-            hashlib.sha256
-        ).hexdigest()
+# ================= CLIENT HANDLER =================
 
-        return hmac.compare_digest(received_sig, computed)
-    except Exception:
-        return False
+async def handle_client(ws, *args):
+    cp_id = "UNKNOWN"
+    last_action[cp_id] = None
+    last_message_time[cp_id] = time.time()
+    active_connections[cp_id] = ws
 
-
-# ================= PROXY HANDLER =================
-
-async def handle_client(websocket):
-    logger.info("Proxy: CP connected id=UNKNOWN")
-    ctx = ClientContext()
+    logger.info("Proxy: CP connected id=%s", cp_id)
 
     try:
-        central = await websockets.connect(
+        async with websockets.connect(
             CENTRAL_URI,
             subprotocols=["ocpp-envelope"]
-        )
+        ) as central_ws:
 
-        async for message in websocket:
-            now = time.time()
+            async def cp_to_cs():
+                async for msg in ws:
+                    now = time.time()
+                    last_message_time[cp_id] = now
 
-            # ================= FLOOD CHECK =================
-            ctx.msg_times = [t for t in ctx.msg_times if now - t < FLOOD_WINDOW]
-            ctx.msg_times.append(now)
+                    # -------- FLOOD DETECTION --------
+                    q = message_times[cp_id]
+                    q.append(now)
+                    while q and now - q[0] > FLOOD_WINDOW:
+                        q.popleft()
 
-            if len(ctx.msg_times) > FLOOD_LIMIT:
-                logger.error("[SECURITY] Flooding detected from UNKNOWN")
-                await websocket.close(code=1013, reason="DoS detected")
-                await central.close()
-                return
+                    if len(q) > FLOOD_LIMIT:
+                        logger.error("[SECURITY] Flooding detected from %s", cp_id)
+                        await ws.close(code=4002, reason="Flood detected")
+                        return
 
-            # ================= MESSAGE PARSING =================
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                logger.error("[SECURITY] Invalid JSON")
-                await websocket.close()
-                return
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        logger.error("[SECURITY] Invalid JSON")
+                        await ws.close(code=4003, reason="Invalid JSON")
+                        return
 
-            # ================= ENVELOPE MODE =================
-            if isinstance(data, dict):
-                nonce = data.get("nonce")
+                    # -------- ENVELOPE CHECK --------
+                    if isinstance(data, dict) and "payload" in data:
+                        payload = data["payload"]
+                        nonce = data["nonce"]
+                        ts = data["timestamp"]
+                        sig = data["signature"]
 
-                if ctx.check_replay(nonce):
-                    logger.error("[SECURITY] Replay attack detected")
-                    await websocket.close()
-                    await central.close()
-                    return
+                        # Replay
+                        if nonce in seen_nonces:
+                            logger.error("[SECURITY] Replay detected (nonce reused)")
+                            await ws.close(code=4004, reason="Replay detected")
+                            return
+                        seen_nonces.add(nonce)
 
-                if not verify_signature(data):
-                    logger.error("[SECURITY] Message tampering detected")
-                    await websocket.close()
-                    await central.close()
-                    return
+                        # Tampering
+                        if not verify_signature(payload, nonce, ts, sig):
+                            logger.error("[SECURITY] Tampering detected (bad signature)")
+                            await ws.close(code=4005, reason="Tampering detected")
+                            return
 
-                payload = json.loads(data["payload"])
-            else:
-                payload = data
+                        inner = json.loads(payload)
+                    else:
+                        inner = data
 
-            # ================= REORDERING CHECK =================
-            if isinstance(payload, list) and len(payload) >= 3:
-                action = payload[2]
+                    # -------- REORDERING DETECTION --------
+                    if isinstance(inner, list) and len(inner) >= 3:
+                        action = inner[2]
+                        prev = last_action.get(cp_id)
 
-                if ctx.check_reordering(action):
-                    logger.error(
-                        f"[SECURITY] Message reordering detected: "
-                        f"last={EXPECTED_FLOW[ctx.last_action_index]} incoming={action}"
-                    )
-                    # Log only – do NOT close (research-friendly)
-            else:
-                action = "UNKNOWN"
+                        if prev:
+                            try:
+                                if EXPECTED_ORDER.index(action) < EXPECTED_ORDER.index(prev):
+                                    logger.error(
+                                        "[SECURITY] Message reordering detected: last=%s incoming=%s",
+                                        prev,
+                                        action,
+                                    )
+                            except ValueError:
+                                pass
 
-            logger.info(f"[CP->CS] {payload}")
+                        last_action[cp_id] = action
 
-            # ================= FORWARD TO CENTRAL =================
-            await central.send(message)
+                    logger.info("[CP->CS] %s", inner)
+                    await central_ws.send(msg)
 
-            # ================= NON-BLOCKING RESPONSE =================
-            try:
-                response = await asyncio.wait_for(central.recv(), timeout=1)
-                await websocket.send(response)
-            except asyncio.TimeoutError:
-                pass
+            async def cs_to_cp():
+                async for msg in central_ws:
+                    logger.info("[CS->CP] %s", msg)
+                    await ws.send(msg)
+
+            await asyncio.gather(cp_to_cs(), cs_to_cp())
 
     except websockets.exceptions.ConnectionClosed:
-        logger.info("Proxy: connection closed")
+        logger.info("Proxy: connection closed for %s", cp_id)
 
     finally:
-        try:
-            await central.close()
-        except Exception:
-            pass
-
+        active_connections.pop(cp_id, None)
+        last_message_time.pop(cp_id, None)
 
 # ================= MAIN =================
 
 async def main():
+    logger.info("Proxy running on ws://%s:%s", PROXY_HOST, PROXY_PORT)
+
     server = await websockets.serve(
         handle_client,
         PROXY_HOST,
@@ -172,9 +182,8 @@ async def main():
         subprotocols=["ocpp1.6"]
     )
 
-    logger.info(f"Proxy running on ws://{PROXY_HOST}:{PROXY_PORT}")
+    asyncio.create_task(heartbeat_watchdog())
     await server.wait_closed()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
