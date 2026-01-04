@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # proxy.py
-# Secure OCPP 1.6 Proxy with attack detection & mitigation
+# OCPP 1.6 Security Proxy with Blocking + Performance Metrics
 
 import asyncio
 import websockets
@@ -15,13 +15,12 @@ from collections import defaultdict, deque
 
 PROXY_HOST = "0.0.0.0"
 PROXY_PORT = 9090
-
 CENTRAL_URI = "ws://localhost:9000"
 SECRET_KEY = b"SuperSecretKey123"
 
-HEARTBEAT_TIMEOUT = 30        # seconds (suppression detection)
-FLOOD_LIMIT = 5              # messages
-FLOOD_WINDOW = 2             # seconds
+HEARTBEAT_TIMEOUT = 30       # suppression detection (seconds)
+FLOOD_LIMIT = 5
+FLOOD_WINDOW = 2
 
 EXPECTED_ORDER = [
     "BootNotification",
@@ -41,16 +40,56 @@ seen_nonces = set()
 last_action = {}
 last_message_time = {}
 message_times = defaultdict(deque)
-active_connections = {}   # <---- REQUIRED FOR SUPPRESSION MITIGATION
+active_connections = {}
 
-# ================= SECURITY UTILS =================
+metrics = {
+    "total": 0,
+    "forwarded": 0,
+    "blocked": 0,
+    "replay": 0,
+    "tamper": 0,
+    "reorder": 0,
+    "flood": 0,
+    "suppress": 0,
+    "latencies": [],
+}
+
+# ================= SECURITY =================
 
 def verify_signature(payload, nonce, ts, signature):
     msg = f"{payload}{nonce}{ts}".encode()
     expected = hmac.new(SECRET_KEY, msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
 
-# ================= HEARTBEAT WATCHDOG =================
+# ================= METRICS =================
+
+def print_metrics():
+    if metrics["latencies"]:
+        avg = sum(metrics["latencies"]) / len(metrics["latencies"])
+        mn = min(metrics["latencies"])
+        mx = max(metrics["latencies"])
+    else:
+        avg = mn = mx = 0.0
+
+    logger.info("========== PERFORMANCE METRICS ==========")
+    logger.info(
+        "total=%d forwarded=%d blocked=%d | replay=%d tamper=%d reorder=%d flood=%d suppress=%d",
+        metrics["total"],
+        metrics["forwarded"],
+        metrics["blocked"],
+        metrics["replay"],
+        metrics["tamper"],
+        metrics["reorder"],
+        metrics["flood"],
+        metrics["suppress"],
+    )
+    logger.info(
+        "latency: avg=%.2fms min=%.2fms max=%.2fms",
+        avg, mn, mx
+    )
+    logger.info("========================================")
+
+# ================= SUPPRESSION WATCHDOG =================
 
 async def heartbeat_watchdog():
     while True:
@@ -58,23 +97,26 @@ async def heartbeat_watchdog():
         for cp_id, last_seen in list(last_message_time.items()):
             if now - last_seen > HEARTBEAT_TIMEOUT:
                 logger.error(
-                    "[SECURITY] Heartbeat SUPPRESSION detected for %s (%.1fs silent) – closing connection",
+                    "[SECURITY] Heartbeat SUPPRESSION detected for %s (%.1fs silent)",
                     cp_id,
                     now - last_seen,
                 )
+                metrics["blocked"] += 1
+                metrics["suppress"] += 1
 
                 ws = active_connections.get(cp_id)
                 if ws:
-                    await ws.close(code=4001, reason="Heartbeat suppression detected")
+                    await ws.close(code=4001, reason="Heartbeat suppression")
 
                 last_message_time.pop(cp_id, None)
                 active_connections.pop(cp_id, None)
+                print_metrics()
 
         await asyncio.sleep(5)
 
 # ================= CLIENT HANDLER =================
 
-async def handle_client(ws, *args):
+async def handle_client(ws):
     cp_id = "UNKNOWN"
     last_action[cp_id] = None
     last_message_time[cp_id] = time.time()
@@ -88,83 +130,99 @@ async def handle_client(ws, *args):
             subprotocols=["ocpp-envelope"]
         ) as central_ws:
 
-            async def cp_to_cs():
-                async for msg in ws:
-                    now = time.time()
-                    last_message_time[cp_id] = now
+            async for msg in ws:
+                metrics["total"] += 1
+                now = time.time()
+                last_message_time[cp_id] = now
 
-                    # -------- FLOOD DETECTION --------
-                    q = message_times[cp_id]
-                    q.append(now)
-                    while q and now - q[0] > FLOOD_WINDOW:
-                        q.popleft()
+                # ---------- FLOOD ----------
+                q = message_times[cp_id]
+                q.append(now)
+                while q and now - q[0] > FLOOD_WINDOW:
+                    q.popleft()
 
-                    if len(q) > FLOOD_LIMIT:
-                        logger.error("[SECURITY] Flooding detected from %s", cp_id)
-                        await ws.close(code=4002, reason="Flood detected")
+                if len(q) > FLOOD_LIMIT:
+                    logger.error("[SECURITY] Flood detected")
+                    metrics["blocked"] += 1
+                    metrics["flood"] += 1
+                    await ws.close(code=4002, reason="Flood")
+                    print_metrics()
+                    return
+
+                # ---------- PARSE ----------
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    logger.error("[SECURITY] Invalid JSON")
+                    metrics["blocked"] += 1
+                    print_metrics()
+                    return
+
+                # ---------- ENVELOPE ----------
+                if isinstance(data, dict) and "payload" in data:
+                    payload = data["payload"]
+                    nonce = data["nonce"]
+                    ts = data["timestamp"]
+                    sig = data["signature"]
+
+                    if nonce in seen_nonces:
+                        logger.error("[SECURITY] Replay detected")
+                        metrics["blocked"] += 1
+                        metrics["replay"] += 1
+                        await ws.close(code=4004, reason="Replay")
+                        print_metrics()
                         return
 
-                    try:
-                        data = json.loads(msg)
-                    except Exception:
-                        logger.error("[SECURITY] Invalid JSON")
-                        await ws.close(code=4003, reason="Invalid JSON")
+                    if not verify_signature(payload, nonce, ts, sig):
+                        logger.error("[SECURITY] Tampering detected")
+                        metrics["blocked"] += 1
+                        metrics["tamper"] += 1
+                        await ws.close(code=4005, reason="Tampering")
+                        print_metrics()
                         return
 
-                    # -------- ENVELOPE CHECK --------
-                    if isinstance(data, dict) and "payload" in data:
-                        payload = data["payload"]
-                        nonce = data["nonce"]
-                        ts = data["timestamp"]
-                        sig = data["signature"]
+                    seen_nonces.add(nonce)
+                    inner = json.loads(payload)
+                else:
+                    inner = data
 
-                        # Replay
-                        if nonce in seen_nonces:
-                            logger.error("[SECURITY] Replay detected (nonce reused)")
-                            await ws.close(code=4004, reason="Replay detected")
+                # ---------- REORDER ----------
+                if isinstance(inner, list) and len(inner) >= 3:
+                    action = inner[2]
+                    prev = last_action.get(cp_id)
+
+                    if prev and action in EXPECTED_ORDER and prev in EXPECTED_ORDER:
+                        if EXPECTED_ORDER.index(action) < EXPECTED_ORDER.index(prev):
+                            logger.error(
+                                "[SECURITY] Reordering detected: %s -> %s",
+                                prev, action
+                            )
+                            metrics["blocked"] += 1
+                            metrics["reorder"] += 1
+                            await ws.close(code=4006, reason="Reordering")
+                            print_metrics()
                             return
-                        seen_nonces.add(nonce)
 
-                        # Tampering
-                        if not verify_signature(payload, nonce, ts, sig):
-                            logger.error("[SECURITY] Tampering detected (bad signature)")
-                            await ws.close(code=4005, reason="Tampering detected")
-                            return
+                    last_action[cp_id] = action
 
-                        inner = json.loads(payload)
-                    else:
-                        inner = data
+                # ---------- FORWARD + LATENCY ----------
+                start = time.time()
+                await central_ws.send(msg)
 
-                    # -------- REORDERING DETECTION --------
-                    if isinstance(inner, list) and len(inner) >= 3:
-                        action = inner[2]
-                        prev = last_action.get(cp_id)
+                try:
+                    response = await asyncio.wait_for(central_ws.recv(), timeout=2)
+                    await ws.send(response)
+                except asyncio.TimeoutError:
+                    pass
 
-                        if prev:
-                            try:
-                                if EXPECTED_ORDER.index(action) < EXPECTED_ORDER.index(prev):
-                                    logger.error(
-                                        "[SECURITY] Message reordering detected: last=%s incoming=%s",
-                                        prev,
-                                        action,
-                                    )
-                            except ValueError:
-                                pass
+                latency = (time.time() - start) * 1000
+                metrics["latencies"].append(latency)
+                metrics["forwarded"] += 1
 
-                        last_action[cp_id] = action
-
-                    logger.info("[CP->CS] %s", inner)
-                    await central_ws.send(msg)
-
-            async def cs_to_cp():
-                async for msg in central_ws:
-                    logger.info("[CS->CP] %s", msg)
-                    await ws.send(msg)
-
-            await asyncio.gather(cp_to_cs(), cs_to_cp())
+                print_metrics()
 
     except websockets.exceptions.ConnectionClosed:
-        logger.info("Proxy: connection closed for %s", cp_id)
+        logger.info("Proxy: connection closed")
 
     finally:
         active_connections.pop(cp_id, None)
@@ -174,14 +232,7 @@ async def handle_client(ws, *args):
 
 async def main():
     logger.info("Proxy running on ws://%s:%s", PROXY_HOST, PROXY_PORT)
-
-    server = await websockets.serve(
-        handle_client,
-        PROXY_HOST,
-        PROXY_PORT,
-        subprotocols=["ocpp1.6"]
-    )
-
+    server = await websockets.serve(handle_client, PROXY_HOST, PROXY_PORT)
     asyncio.create_task(heartbeat_watchdog())
     await server.wait_closed()
 
